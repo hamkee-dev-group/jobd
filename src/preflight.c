@@ -39,8 +39,21 @@ static int require_component(enum jobd_component c,
 	return 0;
 }
 
+static int g_inotify_ready;
+
+void job_inotify_set_ready(int ready)
+{
+	g_inotify_ready = ready;
+}
+
 int job_preflight(const struct job *job, char *errmsg, size_t errmsg_sz)
 {
+	if (job->fanotify_mode != JOBD_FANOTIFY_OFF && !g_inotify_ready) {
+		snprintf(errmsg, errmsg_sz,
+		         "inotify is unavailable; refusing to run a monitored "
+		         "job whose alerts would go unread");
+		return -1;
+	}
 
 	if (job_sandbox_check_caps(errmsg, errmsg_sz) != 0)
 		return -1;

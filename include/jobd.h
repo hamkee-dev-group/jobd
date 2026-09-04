@@ -146,6 +146,7 @@ int job_netd_start(const struct job *job, struct job_sidecars *sc,
 int job_netd_stop(struct job_sidecars *sc, char *errmsg, size_t errmsg_sz);
 
 int job_sandbox_check_caps(char *errmsg, size_t errmsg_sz);
+void job_inotify_set_ready(int ready);
 int job_preflight(const struct job *job, char *errmsg, size_t errmsg_sz);
 
 struct job_entry;

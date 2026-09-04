@@ -645,8 +645,8 @@ int jobd_run_daemon(const struct jobd_runtime *rt)
 
 	g_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 	if (g_inotify_fd < 0)
-		jobd_log("warning: inotify unavailable (%s); fanotify alerts "
-		           "will only be read at job exit", strerror(errno));
+		jobd_log("warning: inotify unavailable (%s); monitored jobs "
+		           "will be rejected", strerror(errno));
 
 	struct ev_src *ls = ev_new(EV_LISTEN, g_listen_fd, NULL);
 	if (!ls || ev_add(g_listen_fd, EPOLLIN, ls) != 0) {
@@ -655,8 +655,14 @@ int jobd_run_daemon(const struct jobd_runtime *rt)
 	}
 	if (g_inotify_fd >= 0) {
 		struct ev_src *is = ev_new(EV_INOTIFY, g_inotify_fd, NULL);
-		if (is)
-			ev_add(g_inotify_fd, EPOLLIN, is);
+		if (is && ev_add(g_inotify_fd, EPOLLIN, is) == 0) {
+			job_inotify_set_ready(1);
+		} else {
+			jobd_log("warning: cannot register inotify with the "
+			           "event loop (%s); monitored jobs will be "
+			           "rejected", strerror(errno));
+			free(is);
+		}
 	}
 
 	char *resp = malloc(RESP_BUF_BYTES);
