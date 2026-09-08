@@ -44,7 +44,7 @@ SRCS = $(SRC_DIR)/buf.c \
 COMMON_OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 TESTS = test_protocol test_job test_policy test_adversarial test_state \
-        test_buf test_request test_preflight
+        test_buf test_request test_preflight test_fanotify
 TEST_BINS = $(TESTS:%=$(BUILD_DIR)/%)
 
 .PHONY: all clean install uninstall test check sanitize lint

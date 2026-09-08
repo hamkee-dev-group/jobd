@@ -343,6 +343,15 @@ The cost is that every `open` in the sandbox waits for fanotifyd to answer.
 Do not drop `--perm` for `observe` mode without re-testing against a real
 overlay mount.
 
+Startup requires the child's PID and its complete `INFO` message
+`fanotifyd started (pid=...) -- 1 mark(s), canaries=..., burst=...`.
+In fanotifyd's `src/daemon.c:daemon_run`, the pidfile follows mark installation,
+but this message follows successful policy, mark, and event-loop setup.
+jobd checks the reported PID and counts, then confirms the child is still alive.
+A component that does not emit this message fails setup within the existing
+three-second polling budget. Diagnostics are kept in `logs/fanotifyd.stderr`;
+the alert log remains JSONL.
+
 ### jobd depends on two sandbox behaviours
 
 `sandbox` must bring loopback up inside the namespace it creates, because

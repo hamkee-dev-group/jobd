@@ -124,6 +124,14 @@ int job_cgroup_kill(const char *jid, char *errmsg, size_t errmsg_sz);
 int job_cgroup_freeze(const char *jid, char *errmsg, size_t errmsg_sz);
 int job_cgroup_remove(const char *jid, char *errmsg, size_t errmsg_sz);
 
+/* Returns argc (excluding NULL), or -1. Storage is owned by the caller. */
+int job_fanotify_build_argv(const struct job *job, const char *bin,
+                            const struct job_sidecars *sc, char *argv[],
+                            int argv_max,
+                            char canary_buf[][JOBD_PATH_LEN_LONG],
+                            char *err, size_t err_sz);
+
+/* Failure leaves fanotifyd_pid zero and any spawned child reaped. */
 int job_fanotify_start(const struct job *job, struct job_sidecars *sc,
                          char *errmsg, size_t errmsg_sz);
 int job_fanotify_stop(struct job_sidecars *sc, char *errmsg, size_t errmsg_sz);
