@@ -117,7 +117,7 @@ void job_reaped(struct job_entry *e, int wstatus)
 	    job_cgroup_read_result(e->result_path, &code, &sig, &oom) == 0) {
 		job->exit_code   = code;
 		job->exit_signal = sig;
-		if (oom)
+		if (oom && job->exit_reason != JOB_EXIT_INTERNAL)
 			job->exit_reason = JOB_EXIT_OOM;
 		else if (sig != 0 && job->exit_reason == JOB_EXIT_NORMAL)
 			job->exit_reason = JOB_EXIT_SIGNAL;
@@ -136,7 +136,9 @@ void job_reaped(struct job_entry *e, int wstatus)
 	    job->exit_reason == JOB_EXIT_OOM)
 		job->state = JOB_KILLED;
 
-	if (job->exit_reason == JOB_EXIT_TIMEOUT ||
+	if (job->exit_reason == JOB_EXIT_INTERNAL)
+		job->state = JOB_FAILED;
+	else if (job->exit_reason == JOB_EXIT_TIMEOUT ||
 	    job->exit_reason == JOB_EXIT_POLICY)
 		job->state = JOB_KILLED;
 	else if (!job_state_is_terminal(job->state))

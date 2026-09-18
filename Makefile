@@ -44,7 +44,7 @@ SRCS = $(SRC_DIR)/buf.c \
 COMMON_OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 TESTS = test_protocol test_job test_policy test_adversarial test_state \
-        test_buf test_request test_preflight test_fanotify
+        test_buf test_request test_preflight test_fanotify test_monitor
 TEST_BINS = $(TESTS:%=$(BUILD_DIR)/%)
 
 .PHONY: all clean install uninstall test check sanitize lint
@@ -94,6 +94,13 @@ uninstall:
 
 $(BUILD_DIR)/test_%: tests/unit/test_%.c $(COMMON_OBJS) | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) $< $(COMMON_OBJS) -o $@ $(ALL_LDFLAGS)
+
+$(BUILD_DIR)/test_monitor: tests/unit/test_monitor.c $(SRC_DIR)/jobd.c $(COMMON_OBJS) | $(BUILD_DIR)
+	$(CC) $(ALL_CFLAGS) $< $(COMMON_OBJS) -o $@ $(ALL_LDFLAGS) \
+		-Wl,--wrap=job_launch,--wrap=job_cgroup_freeze,--wrap=job_cgroup_kill \
+		-Wl,--wrap=job_cgroup_remove,--wrap=jobd_log,--wrap=jobd_log_event \
+		-Wl,--wrap=open,--wrap=close,--wrap=fstat,--wrap=lseek,--wrap=read \
+		-Wl,--wrap=inotify_add_watch
 
 test: $(TEST_BINS)
 	@fail=0; \

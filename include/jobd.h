@@ -167,6 +167,9 @@ void job_cleanup_job(struct job_entry *e);
 int  job_react(struct job_entry *e, enum job_react_action action,
                  char *errmsg, size_t errmsg_sz);
 
+int  job_monitor_start(struct job_entry *e);
+int  job_monitor_fail(struct job_entry *e, const char *cause);
+/* 0: no reaction, 1: contained, -1: monitoring or containment failure. */
 int  job_monitor_scan_alerts(struct job_entry *e);
 
 int  job_build_launch_env(const struct job *job,

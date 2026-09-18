@@ -134,8 +134,15 @@ static void notify_waiters(struct job_entry *e)
 
 static void job_finished(struct job_entry *e, int wstatus)
 {
+	e->waiter_exited = 1;
+	e->waiter_status = wstatus;
 	if (e->pidfd >= 0)
 		ev_del(e->pidfd);
+	job_monitor_scan_alerts(e);
+	/* The cgroup waiter can exit while containment is still failing. */
+	if (e->containment_pending)
+		return;
+
 	if (e->timer_fd >= 0)
 		ev_del(e->timer_fd);
 	if (e->log_wd >= 0 && g_inotify_fd >= 0) {
@@ -143,14 +150,17 @@ static void job_finished(struct job_entry *e, int wstatus)
 		e->log_wd = -1;
 	}
 
-	job_monitor_scan_alerts(e);
-
 	job_reaped(e, wstatus);
 	notify_waiters(e);
 }
 
 static void job_check_exit(struct job_entry *e)
 {
+	if (e->waiter_exited) {
+		if (e->job.state == JOB_RUNNING)
+			job_finished(e, e->waiter_status);
+		return;
+	}
 	if (e->child_pid <= 0)
 		return;
 
@@ -165,8 +175,10 @@ static void job_check_exit(struct job_entry *e)
 static void sweep_running(struct job_entry *e, void *ctx)
 {
 	(void)ctx;
-	if (e->job.state == JOB_RUNNING)
+	if (e->job.state == JOB_RUNNING) {
+		job_monitor_scan_alerts(e);
 		job_check_exit(e);
+	}
 }
 
 static int payload_job_id(const uint8_t *buf, size_t len, char *out,
@@ -283,10 +295,29 @@ static void handle_run(int fd, const struct jobd_msg_header *hdr,
 		if (s)
 			ev_add(e->timer_fd, EPOLLIN, s);
 	}
-	if (g_inotify_fd >= 0 && e->job.fanotify_mode != JOBD_FANOTIFY_OFF &&
-	    e->job.log_dir[0]) {
-		e->log_wd = inotify_add_watch(g_inotify_fd, e->job.log_dir,
-		                              IN_MODIFY | IN_CREATE);
+	if (e->job.fanotify_mode != JOBD_FANOTIFY_OFF) {
+		rc = job_monitor_start(e);
+		if (rc == 0) {
+			do {
+				e->log_wd = inotify_add_watch(g_inotify_fd, e->job.log_dir,
+				    IN_MODIFY | IN_CREATE | IN_MOVED_FROM | IN_MOVED_TO |
+				    IN_DELETE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF |
+				    IN_UNMOUNT | IN_ONLYDIR);
+			} while (e->log_wd < 0 && errno == EINTR);
+			if (e->log_wd < 0) {
+				snprintf(err, sizeof(err), "cannot watch alert log directory: %s",
+				         strerror(errno));
+				rc = job_monitor_fail(e, err);
+			} else {
+				rc = job_monitor_scan_alerts(e);
+			}
+		}
+		if (rc < 0) {
+			job_state_save(&e->job, err, sizeof(err));
+			send_err(fd, hdr->request_id, JOBD_STATUS_ERR_INTERNAL,
+			         "cannot monitor job; containment requested");
+			return;
+		}
 	}
 
 	jobd_send_response(fd, hdr->request_id, JOBD_STATUS_OK,
@@ -495,6 +526,11 @@ static int handle_request(int fd, char *resp)
 				job_react(e, JOB_REACT_KILL, err, sizeof(err));
 				job_check_exit(e);
 			}
+			if (e->containment_pending) {
+				send_err(fd, hdr.request_id, JOBD_STATUS_ERR_INTERNAL,
+				         "containment pending; job remains supervised");
+				break;
+			}
 			notify_waiters(e);
 			job_cleanup_job(e);
 			job_state_delete(jid);
@@ -517,9 +553,27 @@ static int handle_request(int fd, char *resp)
 
 static void scan_if_watched(struct job_entry *e, void *ctx)
 {
-	int wd = *(const int *)ctx;
-	if (e->log_wd >= 0 && e->log_wd == wd)
+	const struct inotify_event *ev = ctx;
+	if (e->job.state != JOB_RUNNING ||
+	    e->job.fanotify_mode == JOBD_FANOTIFY_OFF)
+		return;
+	if (ev->mask & IN_Q_OVERFLOW) {
+		job_monitor_fail(e, "inotify queue overflow");
+	} else if (e->log_wd >= 0 && e->log_wd == ev->wd) {
+		if (ev->mask & (IN_IGNORED | IN_UNMOUNT | IN_DELETE_SELF | IN_MOVE_SELF)) {
+			if (ev->mask & IN_IGNORED)
+				e->log_wd = -1;
+			job_monitor_fail(e, "inotify alert log watch lost");
+			return;
+		}
 		job_monitor_scan_alerts(e);
+	}
+}
+
+static void fail_monitor(struct job_entry *e, void *ctx)
+{
+	if (e->job.state == JOB_RUNNING)
+		job_monitor_fail(e, ctx);
 }
 
 static void handle_inotify(void)
@@ -529,20 +583,36 @@ static void handle_inotify(void)
 		char buf[4096];
 	} u;
 
-	ssize_t n = read(g_inotify_fd, u.buf, sizeof(u.buf));
-	if (n <= 0)
-		return;
+	for (;;) {
+		ssize_t n = read(g_inotify_fd, u.buf, sizeof(u.buf));
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return;
+		if (n <= 0) {
+			char cause[256];
+			snprintf(cause, sizeof(cause), "inotify read: %s",
+			         n < 0 ? strerror(errno) : "unexpected EOF");
+			job_inotify_set_ready(0);
+			ev_del(g_inotify_fd);
+			job_table_foreach(fail_monitor, cause);
+			return;
+		}
 
-	size_t off = 0;
-	while (off + sizeof(struct inotify_event) <= (size_t)n) {
-		struct inotify_event *ev = (struct inotify_event *)(u.buf + off);
-		size_t rec = sizeof(struct inotify_event) + ev->len;
-		if (off + rec > (size_t)n)
-			break;
+		size_t off = 0;
+		while (off + sizeof(struct inotify_event) <= (size_t)n) {
+			struct inotify_event *ev = (struct inotify_event *)(u.buf + off);
+			size_t rec = sizeof(struct inotify_event) + ev->len;
+			if (off + rec > (size_t)n)
+				break;
 
-		int wd = ev->wd;
-		job_table_foreach(scan_if_watched, &wd);
-		off += rec;
+			job_table_foreach(scan_if_watched, ev);
+			off += rec;
+		}
+		if (off != (size_t)n) {
+			job_table_foreach(fail_monitor, "incomplete inotify event");
+			return;
+		}
 	}
 }
 
@@ -706,7 +776,8 @@ int jobd_run_daemon(const struct jobd_runtime *rt)
 				jobd_log("job %s exceeded its %llu ms deadline",
 				           s->job->job.id,
 				           (unsigned long long)s->job->job.timeout_ms);
-				s->job->job.exit_reason = JOB_EXIT_TIMEOUT;
+				if (s->job->job.exit_reason != JOB_EXIT_INTERNAL)
+					s->job->job.exit_reason = JOB_EXIT_TIMEOUT;
 				char err[256];
 				job_react(s->job, JOB_REACT_KILL, err, sizeof(err));
 				break;
