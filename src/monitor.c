@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
 
 #include "jobd.h"
@@ -98,7 +99,7 @@ static int monitor_errno(struct job_entry *e, const char *operation)
 	return job_monitor_fail(e, cause);
 }
 
-static int check_log(struct job_entry *e, int fd, int establish)
+static int check_log(struct job_entry *e, int fd)
 {
 	struct stat st;
 	int rc;
@@ -109,11 +110,7 @@ static int check_log(struct job_entry *e, int fd, int establish)
 		return monitor_errno(e, "stat");
 	if (!S_ISREG(st.st_mode))
 		return job_monitor_fail(e, "alert log is not a regular file");
-	if (establish) {
-		e->log_dev = st.st_dev;
-		e->log_ino = st.st_ino;
-		e->log_identity_set = 1;
-	} else if (st.st_dev != e->log_dev || st.st_ino != e->log_ino) {
+	if (st.st_dev != e->log_dev || st.st_ino != e->log_ino) {
 		return job_monitor_fail(e, "alert log device/inode changed");
 	}
 	if (st.st_size < (off_t)e->log_off)
@@ -133,16 +130,49 @@ static int open_log(struct job_entry *e)
 	return fd;
 }
 
-int job_monitor_start(struct job_entry *e)
+int job_monitor_start(struct job_entry *e, int inotify_fd,
+                       char *errmsg, size_t errmsg_sz)
 {
 	if (e->job.fanotify_mode == JOBD_FANOTIFY_OFF)
 		return 0;
-	int fd = open_log(e);
-	if (fd < 0)
+	int fd;
+	do {
+		fd = open(e->sc.fanotify_log,
+		          O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+	} while (fd < 0 && errno == EINTR);
+	if (fd < 0) {
+		snprintf(errmsg, errmsg_sz, "open alert log: %s", strerror(errno));
 		return -1;
-	int rc = check_log(e, fd, !e->log_identity_set);
+	}
+	struct stat st;
+	int rc;
+	do {
+		rc = fstat(fd, &st);
+	} while (rc < 0 && errno == EINTR);
+	if (rc < 0)
+		snprintf(errmsg, errmsg_sz, "stat alert log: %s", strerror(errno));
 	close(fd);
-	return rc;
+	if (rc < 0)
+		return -1;
+	if (!S_ISREG(st.st_mode)) {
+		snprintf(errmsg, errmsg_sz, "alert log is not a regular file");
+		return -1;
+	}
+	e->log_dev = st.st_dev;
+	e->log_ino = st.st_ino;
+	e->log_identity_set = 1;
+	do {
+		e->log_wd = inotify_add_watch(inotify_fd, e->job.log_dir,
+		    IN_MODIFY | IN_CREATE | IN_MOVED_FROM | IN_MOVED_TO |
+		    IN_DELETE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF |
+		    IN_UNMOUNT | IN_ONLYDIR);
+	} while (e->log_wd < 0 && errno == EINTR);
+	if (e->log_wd < 0) {
+		snprintf(errmsg, errmsg_sz, "cannot watch alert log directory: %s",
+		         strerror(errno));
+		return -1;
+	}
+	return 0;
 }
 
 static int line_is_alert(const char *line)
@@ -168,7 +198,7 @@ int job_monitor_scan_alerts(struct job_entry *e)
 	int fd = open_log(e);
 	if (fd < 0)
 		return -1;
-	if (check_log(e, fd, 0) != 0) {
+	if (check_log(e, fd) != 0) {
 		close(fd);
 		return -1;
 	}
@@ -196,7 +226,7 @@ int job_monitor_scan_alerts(struct job_entry *e)
 			break;
 		}
 		if (got == 0) {
-			if (check_log(e, fd, 0) != 0)
+			if (check_log(e, fd) != 0)
 				fired = -1;
 			break;
 		}

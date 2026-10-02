@@ -97,10 +97,17 @@ $(BUILD_DIR)/test_%: tests/unit/test_%.c $(COMMON_OBJS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/test_monitor: tests/unit/test_monitor.c $(SRC_DIR)/jobd.c $(COMMON_OBJS) | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) $< $(COMMON_OBJS) -o $@ $(ALL_LDFLAGS) \
-		-Wl,--wrap=job_launch,--wrap=job_cgroup_freeze,--wrap=job_cgroup_kill \
+		-Wl,--wrap=job_cgroup_launch,--wrap=job_cgroup_start_waiter \
+		-Wl,--wrap=job_cgroup_freeze,--wrap=job_cgroup_kill \
 		-Wl,--wrap=job_cgroup_remove,--wrap=jobd_log,--wrap=jobd_log_event \
+		-Wl,--wrap=job_sandbox_check_caps,--wrap=job_kernel_landlock_abi \
+		-Wl,--wrap=job_kernel_seccomp_available,--wrap=jobd_component_path \
+		-Wl,--wrap=job_overlay_ensure_store,--wrap=job_overlay_create_ws \
+		-Wl,--wrap=job_overlay_remove_ws,--wrap=job_rootfs_prepare \
+		-Wl,--wrap=job_landlock_generate_policy,--wrap=job_fanotify_start \
+		-Wl,--wrap=job_fanotify_stop,--wrap=job_memfdbus_start \
 		-Wl,--wrap=open,--wrap=close,--wrap=fstat,--wrap=lseek,--wrap=read \
-		-Wl,--wrap=inotify_add_watch
+		-Wl,--wrap=inotify_add_watch,--wrap=inotify_rm_watch,--wrap=epoll_ctl
 
 test: $(TEST_BINS)
 	@fail=0; \

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <string.h>
+#include <sys/inotify.h>
 
 #include "jobd.h"
 #include "state.h"
@@ -53,29 +54,35 @@ static void test_ready_backend_not_gated(void)
 
 	struct job job;
 	job_inotify_set_ready(1);
+	make_job(&job, JOBD_FANOTIFY_OBSERVE);
+	ASSERT(!refused_for_inotify(&job), "observe must pass the gate");
 	make_job(&job, JOBD_FANOTIFY_DENY);
 	ASSERT(!refused_for_inotify(&job), "deny must pass the gate");
 	PASS();
 }
 
-static void test_launch_stops_at_preflight(void)
+static void test_launch_stops_at_preflight(uint8_t mode, int inotify_fd)
 {
-	TEST("launching a monitored job stops at preflight");
+	TEST("missing or unregistered backend stops monitored launch at preflight");
 
 	static struct job_entry e;
+	memset(&e, 0, sizeof(e));
+	e.pidfd = e.timer_fd = e.log_wd = -1;
 	char resp[2048];
 	struct agd_buf out;
 
 	job_inotify_set_ready(0);
-	make_job(&e.job, JOBD_FANOTIFY_OBSERVE);
+	make_job(&e.job, mode);
 	agd_buf_init(&out, resp, sizeof(resp));
 
-	ASSERT(job_launch(&e, &out) != 0, "launch should fail");
+	ASSERT(job_launch(&e, inotify_fd, &out) != 0, "launch should fail");
 	ASSERT(e.job.state == JOB_FAILED &&
 	       e.job.exit_reason == JOB_EXIT_SETUP, "job should fail in setup");
 	ASSERT(strstr(resp, "FAIL preflight") != NULL, resp);
 	ASSERT(strstr(resp, "step1") == NULL && e.workload_pid == 0,
 	       "nothing may be launched");
+	ASSERT(e.log_wd == -1 && !e.log_identity_set,
+	       "rejected launch must not initialize per-job monitoring");
 	PASS();
 }
 
@@ -86,7 +93,14 @@ int main(void)
 	test_missing_backend_rejects_monitored();
 	test_fanotify_off_not_gated();
 	test_ready_backend_not_gated();
-	test_launch_stops_at_preflight();
+	int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (fd < 0)
+		return 1;
+	for (uint8_t mode = JOBD_FANOTIFY_OBSERVE; mode <= JOBD_FANOTIFY_DENY; mode++) {
+		test_launch_stops_at_preflight(mode, -1);
+		test_launch_stops_at_preflight(mode, fd);
+	}
+	close(fd);
 
 	TEST_SUMMARY();
 }

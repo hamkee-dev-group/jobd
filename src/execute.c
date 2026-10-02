@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -116,11 +117,13 @@ struct rollback {
 	int overlay;
 	int rootfs;
 	int fanotify;
+	int monitor;
 	int memfdbus;
 	int iouringd;
 };
 
-static void rollback_unwind(struct job_entry *e, const struct rollback *rb)
+static void rollback_unwind(struct job_entry *e, const struct rollback *rb,
+                            int inotify_fd)
 {
 	char err[256];
 
@@ -130,6 +133,13 @@ static void rollback_unwind(struct job_entry *e, const struct rollback *rb)
 		job_iouringd_stop(&e->sc, err, sizeof(err));
 	if (rb->memfdbus)
 		job_memfdbus_stop(&e->sc, err, sizeof(err));
+	if (rb->monitor) {
+		int rc;
+		do {
+			rc = inotify_rm_watch(inotify_fd, e->log_wd);
+		} while (rc < 0 && errno == EINTR);
+		e->log_wd = -1;
+	}
 	if (rb->fanotify)
 		job_fanotify_stop(&e->sc, err, sizeof(err));
 	if (rb->overlay || rb->rootfs)
@@ -172,7 +182,7 @@ static int make_job_dirs(const struct job *job, char *err, size_t err_sz)
 	return 0;
 }
 
-int job_launch(struct job_entry *e, struct agd_buf *out)
+int job_launch(struct job_entry *e, int inotify_fd, struct agd_buf *out)
 {
 	struct job *job = &e->job;
 	struct rollback rb = { 0 };
@@ -250,6 +260,12 @@ int job_launch(struct job_entry *e, struct agd_buf *out)
 	}
 	if (e->sc.fanotifyd_pid > 0)
 		rb.fanotify = 1;
+	if (job_monitor_start(e, inotify_fd, err, sizeof(err)) != 0) {
+		agd_buf_addf(out, "FAIL alert monitoring: %s\n", err);
+		goto fail;
+	}
+	if (e->log_wd >= 0)
+		rb.monitor = 1;
 	job->state = JOB_MONITOR_READY;
 	agd_buf_adds(out, "  ok\n");
 
@@ -405,7 +421,7 @@ int job_launch(struct job_entry *e, struct agd_buf *out)
 	return 0;
 
 fail:
-	rollback_unwind(e, &rb);
+	rollback_unwind(e, &rb, inotify_fd);
 	job->state = JOB_FAILED;
 	job->exit_reason = JOB_EXIT_SETUP;
 	jobd_log_event(job->id, "jobd", "setup_failed", err);

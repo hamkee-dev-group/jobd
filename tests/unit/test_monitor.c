@@ -8,10 +8,18 @@
 static char tmp[] = "/tmp/jobd-monitor-test-XXXXXX";
 static char log_path[512], log_dir[512], moved_path[512], replacement[512];
 static char result_path[512];
+static char job_dir[512];
 static int writer = -1, release_fd = -1;
 static pid_t child;
 static int kill_calls, freeze_calls;
 static int kill_fails, freeze_fails, launch_status, alert_count;
+static int launch_calls, watch_calls, watch_wd = -1, removed_wd = -1;
+static int overlay_created, overlay_removed, fanotify_started, fanotify_stopped;
+static int launch_alert, dry_run;
+enum setup_failure { SETUP_OK, MEMFDBUS_FAIL, LAUNCH_FAIL, WAITER_FAIL };
+static enum setup_failure setup_failure;
+static struct ev_src inotify_source;
+static struct ev_src *job_sources[2];
 static char messages[8192], failure_job[JOBD_MAX_JOB_ID + 1], failure_cause[256];
 
 enum fault_op { NO_FAULT, LOG_OPEN, LOG_STAT, LOG_SEEK, LOG_READ, WATCH, EVENTS };
@@ -47,6 +55,21 @@ int __real_fstat(int fd, struct stat *st);
 off_t __real_lseek(int fd, off_t off, int whence);
 ssize_t __real_read(int fd, void *buf, size_t size);
 int __real_inotify_add_watch(int fd, const char *path, uint32_t mask);
+int __real_inotify_rm_watch(int fd, int wd);
+int __real_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+
+int __wrap_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
+{
+	if (op == EPOLL_CTL_ADD) {
+		struct ev_src *src = event->data.ptr;
+		/* Retain the real launch's sources for per-test event-loop teardown. */
+		if (src->kind == EV_PIDFD)
+			job_sources[0] = src;
+		else if (src->kind == EV_TIMER)
+			job_sources[1] = src;
+	}
+	return __real_epoll_ctl(epfd, op, fd, event);
+}
 
 int __wrap_open(const char *path, int flags, ...)
 {
@@ -108,9 +131,30 @@ ssize_t __wrap_read(int fd, void *buf, size_t size)
 
 int __wrap_inotify_add_watch(int fd, const char *path, uint32_t mask)
 {
+	watch_calls++;
 	if (fault(WATCH))
 		return -1;
-	return __real_inotify_add_watch(fd, path, mask);
+	if (fd != g_inotify_fd || strcmp(path, log_dir) != 0 ||
+	    mask != (IN_MODIFY | IN_CREATE | IN_MOVED_FROM | IN_MOVED_TO |
+	             IN_DELETE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF |
+	             IN_UNMOUNT | IN_ONLYDIR) || !fanotify_started) {
+		FAIL("watch must follow fanotify startup and retain its directory and mask");
+		errno = EINVAL;
+		return -1;
+	}
+	watch_wd = __real_inotify_add_watch(fd, path, mask);
+	return watch_wd;
+}
+
+int __wrap_inotify_rm_watch(int fd, int wd)
+{
+	int rc = __real_inotify_rm_watch(fd, wd);
+	if (rc == 0) {
+		removed_wd = wd;
+		if (wd == watch_wd)
+			watch_wd = -1;
+	}
+	return rc;
 }
 
 void __wrap_jobd_log(const char *fmt, ...)
@@ -157,8 +201,123 @@ int __wrap_job_cgroup_remove(const char *id, char *err, size_t sz)
 	return 0;
 }
 
-int __wrap_job_launch(struct job_entry *e, struct agd_buf *out)
+int __wrap_job_sandbox_check_caps(char *err, size_t sz)
 {
+	snprintf(err, sz, "caps ok");
+	return 0;
+}
+
+int __wrap_job_kernel_landlock_abi(void) { return 1; }
+int __wrap_job_kernel_seccomp_available(void) { return 1; }
+
+const char *__wrap_jobd_component_path(enum jobd_component c)
+{
+	(void)c;
+	return "/bin/true";
+}
+
+int __wrap_job_overlay_ensure_store(char *err, size_t sz)
+{
+	snprintf(err, sz, "store ok");
+	return 0;
+}
+
+int __wrap_job_overlay_create_ws(const struct job *job, char *err, size_t sz)
+{
+	snprintf(err, sz, "workspace ok");
+	overlay_created++;
+	return mkdir(job->root_path, 0700);
+}
+
+void __wrap_job_overlay_remove_ws(const char *id)
+{
+	(void)id;
+	overlay_removed++;
+}
+
+int __wrap_job_rootfs_prepare(struct job *job, char *err, size_t sz)
+{
+	(void)job;
+	snprintf(err, sz, "rootfs ok");
+	return 0;
+}
+
+int __wrap_job_landlock_generate_policy(const struct job *job, const char *path,
+                                       char *err, size_t sz)
+{
+	(void)job; (void)path;
+	snprintf(err, sz, "policy ok");
+	return 0;
+}
+
+int __wrap_job_fanotify_start(const struct job *job, struct job_sidecars *sc,
+                             char *err, size_t sz)
+{
+	snprintf(err, sz, "fanotify ok");
+	if (job->fanotify_mode != JOBD_FANOTIFY_OFF) {
+		fanotify_started++;
+		sc->fanotifyd_pid = 12345;
+		snprintf(sc->fanotify_log, sizeof(sc->fanotify_log), "%s", log_path);
+	}
+	return 0;
+}
+
+int __wrap_job_fanotify_stop(struct job_sidecars *sc, char *err, size_t sz)
+{
+	snprintf(err, sz, "fanotify stopped");
+	if (sc->fanotifyd_pid > 0)
+		fanotify_stopped++;
+	sc->fanotifyd_pid = 0;
+	return 0;
+}
+
+int __wrap_job_memfdbus_start(const struct job *job, struct job_sidecars *sc,
+                             char *err, size_t sz)
+{
+	(void)job; (void)sc;
+	snprintf(err, sz, "injected memfdbus failure");
+	return setup_failure == MEMFDBUS_FAIL ? -1 : 0;
+}
+
+int __wrap_job_cgroup_launch(const struct job *job, char *const av[],
+                            char *const env[], pid_t *pid,
+                            char *err, size_t sz)
+{
+	(void)av; (void)env;
+	launch_calls++;
+	struct job_entry *e = job_table_find(job->id);
+	struct stat st;
+	if (job->fanotify_mode != JOBD_FANOTIFY_OFF &&
+	    (!e || !e->log_identity_set || e->log_wd < 0 ||
+	     e->log_wd != watch_wd || fstat(writer, &st) != 0 ||
+	     e->log_dev != st.st_dev || e->log_ino != st.st_ino)) {
+		FAIL("workload launch entered before log identity and watch were established");
+		snprintf(err, sz, "monitor was not armed before workload launch");
+		return -1;
+	}
+	if (launch_alert) {
+		const char alert[] = "{\"alert\":true}\n";
+		struct epoll_event event;
+		if (write(writer, alert, sizeof(alert) - 1) != sizeof(alert) - 1 ||
+		    epoll_wait(g_epoll_fd, &event, 1, 0) != 1 ||
+		    event.data.ptr != &inotify_source) {
+			FAIL("launch-time alert did not reach the registered inotify backend");
+			return -1;
+		}
+	}
+	*pid = 12346;
+	snprintf(err, sz, "injected launch failure");
+	return setup_failure == LAUNCH_FAIL ? -1 : 0;
+}
+
+int __wrap_job_cgroup_start_waiter(const char *id, const char *path, pid_t *pid,
+                                  char *err, size_t sz)
+{
+	(void)id; (void)path;
+	if (setup_failure == WAITER_FAIL) {
+		snprintf(err, sz, "injected waiter failure");
+		return -1;
+	}
 	int p[2];
 	if (pipe(p) != 0)
 		return -1;
@@ -175,11 +334,7 @@ int __wrap_job_launch(struct job_entry *e, struct agd_buf *out)
 	release_fd = p[1];
 	if (child < 0)
 		return -1;
-	e->child_pid = child;
-	e->job.state = JOB_RUNNING;
-	snprintf(e->job.log_dir, sizeof(e->job.log_dir), "%s", log_dir);
-	snprintf(e->sc.fanotify_log, sizeof(e->sc.fanotify_log), "%s", log_path);
-	agd_buf_adds(out, "launched\n");
+	*pid = child;
 	return 0;
 }
 
@@ -187,14 +342,27 @@ static int setup(void)
 {
 	kill_calls = freeze_calls = 0;
 	kill_fails = freeze_fails = alert_count = 0;
+	launch_calls = watch_calls = 0;
+	watch_wd = removed_wd = -1;
+	overlay_created = overlay_removed = fanotify_started = fanotify_stopped = 0;
+	launch_alert = dry_run = 0;
+	setup_failure = SETUP_OK;
 	fault_op = NO_FAULT;
 	fault_skip = fault_count = change_device = inject_event = 0;
 	messages[0] = failure_job[0] = failure_cause[0] = '\0';
-	job_inotify_set_ready(1);
+	job_inotify_set_ready(0);
+	if (mkdir(job_dir, 0700) != 0 || mkdir(log_dir, 0700) != 0)
+		return -1;
 	writer = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0600);
 	g_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 	g_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-	return writer >= 0 && g_inotify_fd >= 0 && g_epoll_fd >= 0 ? 0 : -1;
+	if (writer < 0 || g_inotify_fd < 0 || g_epoll_fd < 0)
+		return -1;
+	inotify_source = (struct ev_src){ .kind = EV_INOTIFY, .fd = g_inotify_fd };
+	if (ev_add(g_inotify_fd, EPOLLIN, &inotify_source) != 0)
+		return -1;
+	job_inotify_set_ready(1);
+	return 0;
 }
 
 static void teardown(void)
@@ -206,10 +374,19 @@ static void teardown(void)
 			;
 	child = 0;
 	release_fd = -1;
+	fault_op = NO_FAULT;
+	struct job_entry *e = job_table_find("monitored");
+	if (e)
+		job_cleanup_job(e);
 	close(writer);
 	close(g_inotify_fd);
 	close(g_epoll_fd);
 	g_inotify_fd = g_epoll_fd = -1;
+	for (size_t i = 0; i < sizeof(job_sources) / sizeof(job_sources[0]); i++) {
+		free(job_sources[i]);
+		job_sources[i] = NULL;
+	}
+	job_inotify_set_ready(0);
 	job_table_init();
 	job_state_delete("monitored");
 	unlink(log_path);
@@ -217,6 +394,8 @@ static void teardown(void)
 	unlink(moved_path);
 	unlink(replacement);
 	unlink(result_path);
+	rmdir(log_dir);
+	rmdir(job_dir);
 }
 
 static struct job_entry *launch(uint8_t mode)
@@ -226,6 +405,7 @@ static struct job_entry *launch(uint8_t mode)
 	job_set_defaults(&job);
 	snprintf(job.id, sizeof(job.id), "monitored");
 	job.fanotify_mode = mode;
+	job.dry_run = dry_run;
 	if (job_add_arg(&job, "/bin/true", err, sizeof(err)) != 0)
 		return NULL;
 	uint8_t request[JOBD_MAX_PAYLOAD];
@@ -464,27 +644,99 @@ static void test_reaction_failure(int fail_kill, int events)
 	PASS();
 }
 
-static void test_launch_failure(enum fault_op op)
+static void test_launch_failure(enum fault_op op, uint8_t mode)
 {
-	TEST("monitor setup failure rejects launch and keeps pending containment supervised");
+	TEST("monitor setup failure prevents workload launch and unwinds setup");
 	ASSERT(setup() == 0, "setup failed");
 	if (op == NO_FAULT)
 		ASSERT(unlink(log_path) == 0, "unlink failed");
 	else
 		inject(op, op == WATCH ? ENOSPC : EACCES, -1);
-	kill_fails = 1;
-	ASSERT(launch(JOBD_FANOTIFY_DENY) == NULL &&
-	       launch_status == JOBD_STATUS_ERR_INTERNAL, "unmonitored launch succeeded");
+	ASSERT(launch(mode) == NULL && launch_status == JOBD_STATUS_ERR_SETUP,
+	       "monitor failure was not reported as a setup error");
 	struct job_entry *e = job_table_find("monitored");
-	ASSERT(e && monitoring_failed(e, op == WATCH ? "watch" : "open"),
-	       "launched workload was not contained after monitor setup failed");
-	ASSERT(!e->reacted && e->containment_pending && waitpid(child, NULL, WNOHANG) == 0,
-	       "pending launch was removed from supervision");
-	int calls = kill_calls;
-	kill_fails = 0;
+	ASSERT(e && e->job.state == JOB_FAILED && e->job.exit_reason == JOB_EXIT_SETUP,
+	       "monitor failure did not leave a failed setup");
+	ASSERT(launch_calls == 0 && e->workload_pid == 0 && e->child_pid == 0,
+	       "workload was launched before monitoring failed");
+	ASSERT(overlay_created == 1 && overlay_removed == 1 &&
+	       fanotify_started == 1 && fanotify_stopped == 1 &&
+	       access(job_dir, F_OK) != 0, "setup resources were not unwound");
+	ASSERT(e->log_wd == -1 && watch_wd == -1, "failed setup retained a watch");
+	ASSERT(watch_calls == (op == WATCH), "failure did not occur at the injected step");
+	ASSERT(!e->monitor_failed && !e->containment_pending,
+	       "setup failure was treated as runtime monitoring loss");
+	struct job loaded;
+	char err[256];
+	ASSERT(job_state_load(e->job.id, &loaded, err, sizeof(err)) == 0 &&
+	       loaded.state == JOB_FAILED && loaded.exit_reason == JOB_EXIT_SETUP,
+	       "persisted result lost the setup failure");
+	PASS();
+}
+
+static void test_armed_launch(uint8_t mode)
+{
+	TEST("real launch arms identity and watch before the workload writes an alert");
+	ASSERT(setup() == 0, "setup failed");
+	launch_alert = 1;
+	struct job_entry *e = launch(mode);
+	ASSERT(e && launch_calls == 1 && watch_calls == 1,
+	       "monitoring was not established exactly once before launch");
+	handle_inotify();
 	job_table_foreach(sweep_running, NULL);
-	ASSERT(kill_calls == calls + 1 && !e->containment_pending && e->reacted,
-	       "failed startup containment was not retried");
+	ASSERT(e->log_off > 0 && alert_count == 1, "launch-time alert was lost or repeated");
+	ASSERT(kill_calls == (mode == JOBD_FANOTIFY_DENY) &&
+	       freeze_calls == (mode == JOBD_FANOTIFY_DENY), "wrong launch-time reaction");
+	ASSERT(e->job.exit_reason == (mode == JOBD_FANOTIFY_DENY ?
+	       JOB_EXIT_POLICY : JOB_EXIT_NORMAL), "wrong launch-time exit reason");
+	PASS();
+}
+
+static void test_armed_rollback(enum setup_failure failure)
+{
+	TEST("later setup failure removes the installed watch and resets its descriptor");
+	ASSERT(setup() == 0, "setup failed");
+	setup_failure = failure;
+	ASSERT(launch(JOBD_FANOTIFY_DENY) == NULL &&
+	       launch_status == JOBD_STATUS_ERR_SETUP, "injected setup failure succeeded");
+	struct job_entry *e = job_table_find("monitored");
+	ASSERT(e && e->job.state == JOB_FAILED && e->job.exit_reason == JOB_EXIT_SETUP,
+	       "wrong setup failure state");
+	ASSERT(e->log_identity_set && watch_calls == 1 && removed_wd >= 0 &&
+	       watch_wd == -1 && e->log_wd == -1, "installed watch was not rolled back");
+	ASSERT(__real_inotify_rm_watch(g_inotify_fd, removed_wd) == -1 && errno == EINVAL,
+	       "rolled-back watch is still active");
+	ASSERT(launch_calls == (failure != MEMFDBUS_FAIL), "unexpected workload launch");
+	ASSERT(fanotify_stopped == 1 && overlay_removed == 1 &&
+	       access(job_dir, F_OK) != 0, "setup resources were not unwound");
+	PASS();
+}
+
+static void test_backend_gate(uint8_t mode, int missing, int planning)
+{
+	TEST("missing or unregistered backend gates monitored launches, but not off or dry-run");
+	ASSERT(setup() == 0, "setup failed");
+	ev_del(g_inotify_fd);
+	job_inotify_set_ready(0);
+	if (missing) {
+		close(g_inotify_fd);
+		g_inotify_fd = -1;
+	}
+	dry_run = planning;
+	struct job_entry *e = launch(mode);
+	ASSERT(watch_calls == 0, "off, dry-run, or rejected launch acquired a watch");
+	if (planning) {
+		ASSERT(launch_status == JOBD_STATUS_OK && !e &&
+		       launch_calls == 0 && overlay_created == 0, "dry-run acquired resources");
+	} else if (mode == JOBD_FANOTIFY_OFF) {
+		ASSERT(e && launch_status == JOBD_STATUS_OK && launch_calls == 1 &&
+		       !e->log_identity_set && e->log_wd == -1, "off was gated on monitoring");
+	} else {
+		e = job_table_find("monitored");
+		ASSERT(launch_status == JOBD_STATUS_ERR_SETUP && e &&
+		       e->job.state == JOB_FAILED && e->job.exit_reason == JOB_EXIT_SETUP &&
+		       launch_calls == 0 && overlay_created == 0, "backend gate was bypassed");
+	}
 	PASS();
 }
 
@@ -658,15 +910,38 @@ int main(void)
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (!mkdtemp(tmp))
 		return 1;
-	snprintf(log_dir, sizeof(log_dir), "%s/logs", tmp);
-	snprintf(log_path, sizeof(log_path), "%s/logs/fanotifyd.jsonl", tmp);
+	snprintf(job_dir, sizeof(job_dir), "%s/monitored", tmp);
+	snprintf(log_dir, sizeof(log_dir), "%s/monitored/logs", tmp);
+	snprintf(log_path, sizeof(log_path), "%s/monitored/logs/fanotifyd.jsonl", tmp);
 	snprintf(moved_path, sizeof(moved_path), "%s/original.jsonl", tmp);
 	snprintf(replacement, sizeof(replacement), "%s/replacement.jsonl", tmp);
-	snprintf(result_path, sizeof(result_path), "%s/logs/cgroup.result", tmp);
+	snprintf(result_path, sizeof(result_path), "%s/monitored/logs/cgroup.result", tmp);
 	char err[256];
-	if (mkdir(log_dir, 0700) != 0 ||
+	if (jobd_config_set("runtime_dir", tmp, err, sizeof(err)) != 0 ||
 	    jobd_config_set("state_dir", tmp, err, sizeof(err)) != 0)
 		return 1;
+	for (uint8_t mode = JOBD_FANOTIFY_OBSERVE; mode <= JOBD_FANOTIFY_DENY; mode++) {
+		test_armed_launch(mode);
+		teardown();
+		test_launch_failure(WATCH, mode);
+		teardown();
+		test_launch_failure(LOG_OPEN, mode);
+		teardown();
+		test_launch_failure(NO_FAULT, mode);
+		teardown();
+	}
+	for (enum setup_failure failure = MEMFDBUS_FAIL; failure <= WAITER_FAIL; failure++) {
+		test_armed_rollback(failure);
+		teardown();
+	}
+	for (int missing = 0; missing <= 1; missing++) {
+		for (uint8_t mode = JOBD_FANOTIFY_OFF; mode <= JOBD_FANOTIFY_DENY; mode++) {
+			for (int planning = 0; planning <= 1; planning++) {
+				test_backend_gate(mode, missing, planning);
+				teardown();
+			}
+		}
+	}
 	test_replacement_event();
 	teardown();
 	test_replacement_sweep();
@@ -718,12 +993,6 @@ int main(void)
 		test_final_failure(fail_kill);
 		teardown();
 	}
-	test_launch_failure(WATCH);
-	teardown();
-	test_launch_failure(LOG_OPEN);
-	teardown();
-	test_launch_failure(NO_FAULT);
-	teardown();
 	test_cleanup_pending();
 	teardown();
 	test_loss_during_containment();

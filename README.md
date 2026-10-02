@@ -241,6 +241,8 @@ the rollback stack, and the workload never runs.
    and any client binaries the requested features need
 5. compile the landlockd policy (Landlock rules + seccomp deny list)
 6. start fanotifyd, if monitoring was requested
+   establish the alert-log identity and arm its directory watch on the
+   daemon's registered inotify backend before launching the workload
 7. start memfdbus and publish the sealed inputs, if any
 8. start iouringd, if requested
 9. start job-netd, if networking is brokered

@@ -159,7 +159,7 @@ int job_preflight(const struct job *job, char *errmsg, size_t errmsg_sz);
 
 struct job_entry;
 
-int  job_launch(struct job_entry *e, struct agd_buf *out);
+int  job_launch(struct job_entry *e, int inotify_fd, struct agd_buf *out);
 
 void job_reaped(struct job_entry *e, int wstatus);
 void job_stop_services(struct job_entry *e);
@@ -167,7 +167,8 @@ void job_cleanup_job(struct job_entry *e);
 int  job_react(struct job_entry *e, enum job_react_action action,
                  char *errmsg, size_t errmsg_sz);
 
-int  job_monitor_start(struct job_entry *e);
+int  job_monitor_start(struct job_entry *e, int inotify_fd,
+                       char *errmsg, size_t errmsg_sz);
 int  job_monitor_fail(struct job_entry *e, const char *cause);
 /* 0: no reaction, 1: contained, -1: monitoring or containment failure. */
 int  job_monitor_scan_alerts(struct job_entry *e);

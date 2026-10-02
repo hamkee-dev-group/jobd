@@ -274,7 +274,7 @@ static void handle_run(int fd, const struct jobd_msg_header *hdr,
 	struct agd_buf out;
 	agd_buf_init(&out, resp, RESP_BUF_BYTES);
 
-	int rc = job_launch(e, &out);
+	int rc = job_launch(e, g_inotify_fd, &out);
 
 	job_state_save(&e->job, err, sizeof(err));
 
@@ -296,22 +296,7 @@ static void handle_run(int fd, const struct jobd_msg_header *hdr,
 			ev_add(e->timer_fd, EPOLLIN, s);
 	}
 	if (e->job.fanotify_mode != JOBD_FANOTIFY_OFF) {
-		rc = job_monitor_start(e);
-		if (rc == 0) {
-			do {
-				e->log_wd = inotify_add_watch(g_inotify_fd, e->job.log_dir,
-				    IN_MODIFY | IN_CREATE | IN_MOVED_FROM | IN_MOVED_TO |
-				    IN_DELETE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF |
-				    IN_UNMOUNT | IN_ONLYDIR);
-			} while (e->log_wd < 0 && errno == EINTR);
-			if (e->log_wd < 0) {
-				snprintf(err, sizeof(err), "cannot watch alert log directory: %s",
-				         strerror(errno));
-				rc = job_monitor_fail(e, err);
-			} else {
-				rc = job_monitor_scan_alerts(e);
-			}
-		}
+		rc = job_monitor_scan_alerts(e);
 		if (rc < 0) {
 			job_state_save(&e->job, err, sizeof(err));
 			send_err(fd, hdr->request_id, JOBD_STATUS_ERR_INTERNAL,
@@ -702,6 +687,7 @@ static int setup_listener(void)
 int jobd_run_daemon(const struct jobd_runtime *rt)
 {
 	(void)rt;
+	job_inotify_set_ready(0);
 
 	g_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 	if (g_epoll_fd < 0) {
