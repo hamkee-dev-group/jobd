@@ -95,6 +95,10 @@ uninstall:
 $(BUILD_DIR)/test_%: tests/unit/test_%.c $(COMMON_OBJS) | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) $< $(COMMON_OBJS) -o $@ $(ALL_LDFLAGS)
 
+$(BUILD_DIR)/test_adversarial: tests/unit/test_adversarial.c $(COMMON_OBJS) | $(BUILD_DIR)
+	$(CC) $(ALL_CFLAGS) $< $(COMMON_OBJS) -o $@ $(ALL_LDFLAGS) \
+		-Wl,--wrap=job_elf_resolve_deps,--wrap=mknodat,--wrap=unlinkat
+
 $(BUILD_DIR)/test_monitor: tests/unit/test_monitor.c $(SRC_DIR)/jobd.c $(COMMON_OBJS) | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) $< $(COMMON_OBJS) -o $@ $(ALL_LDFLAGS) \
 		-Wl,--wrap=job_cgroup_launch,--wrap=job_cgroup_start_waiter \
